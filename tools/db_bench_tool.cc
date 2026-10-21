@@ -255,6 +255,9 @@ DEFINE_string(
     "\tcompact0  -- compact L0 into L1\n"
     "\tcompact1  -- compact L1 into L2\n"
     "\twaitforcompaction - pause until compaction is (probably) done\n"
+    "\trebuildfilters -- rewrite every SST file in place (same level and "
+    "key range) so its filter is rebuilt with the current filter flags; "
+    "requires -use_existing_db and -disable_auto_compactions\n"
     "\tflush - flush the memtable\n"
     "\tingestexternalfile -- Create external SST files and ingest them into "
     "the DB via IngestExternalFile\n"
@@ -4424,6 +4427,8 @@ class Benchmark {
         CompactLevel(1);
       } else if (name == "waitforcompaction") {
         WaitForCompaction();
+      } else if (name == "rebuildfilters") {
+        RebuildFilters();
       } else if (name == "flush") {
         Flush();
       } else if (name == "crc32c") {
@@ -10611,6 +10616,87 @@ class Benchmark {
     } else {
       for (auto& db_with_cfh : multi_dbs_) {
         WaitForCompactionHelper(db_with_cfh);
+      }
+    }
+  }
+
+  // Prints aggregated table properties (entries, data size, filter size, ...)
+  // for each non-empty level, prefixed by `tag`, for comparing LSM shape.
+  static void PrintLevelTableProperties(DB* db, ColumnFamilyHandle* cfh,
+                                        const char* tag) {
+    for (int level = 0; level < db->NumberLevels(cfh); ++level) {
+      std::string num_files;
+      std::string props;
+      const std::string level_str = std::to_string(level);
+      if (!db->GetProperty(cfh, "rocksdb.num-files-at-level" + level_str,
+                           &num_files) ||
+          num_files == "0") {
+        continue;
+      }
+      if (db->GetProperty(
+              cfh, "rocksdb.aggregated-table-properties-at-level" + level_str,
+              &props)) {
+        fprintf(stdout, "%s L%d: # files=%s; %s\n", tag, level,
+                num_files.c_str(), props.c_str());
+      }
+    }
+  }
+
+  // Rewrites each SST file with a single-file CompactFiles() into the level
+  // it already occupies. Keys, values, file count per level and key range
+  // per file are unchanged, so lookups touch exactly the same files; only
+  // the filter (and file numbers) change. The output is one file per input
+  // (no size limit) and is always rewritten, never trivially moved.
+  void RebuildFiltersHelper(DBWithColumnFamilies& db_with_cfh) {
+    DB* db = db_with_cfh.db;
+    std::vector<ColumnFamilyHandle*> cfhs = db_with_cfh.cfh;
+    if (cfhs.empty()) {
+      cfhs.push_back(db->DefaultColumnFamily());
+    }
+    CompactionOptions copts;
+    copts.output_file_size_limit = std::numeric_limits<uint64_t>::max();
+    copts.allow_trivial_move = false;
+    copts.max_subcompactions = 1;
+
+    for (ColumnFamilyHandle* cfh : cfhs) {
+      PrintLevelTableProperties(db, cfh, "rebuildfilters before");
+      // Snapshot the file list up front; each rewrite adds a new file.
+      ColumnFamilyMetaData meta;
+      db->GetColumnFamilyMetaData(cfh, &meta);
+      uint64_t start = FLAGS_env->NowMicros();
+      size_t rewritten = 0;
+      for (const LevelMetaData& level : meta.levels) {
+        for (const SstFileMetaData& file : level.files) {
+          Status s = db->CompactFiles(copts, cfh, {file.name}, level.level);
+          if (!s.ok()) {
+            fprintf(stderr,
+                    "rebuildfilters: CompactFiles(%s, L%d) failed: %s\n",
+                    file.name.c_str(), level.level, s.ToString().c_str());
+            db_bench_exit(1);
+          }
+          ++rewritten;
+        }
+      }
+      fprintf(stdout, "rebuildfilters(%s, %s): rewrote %zu files in %.3f s\n",
+              db->GetName().c_str(), cfh->GetName().c_str(), rewritten,
+              (FLAGS_env->NowMicros() - start) / 1e6);
+      PrintLevelTableProperties(db, cfh, "rebuildfilters after");
+    }
+  }
+
+  void RebuildFilters() {
+    if (!FLAGS_use_existing_db || !FLAGS_disable_auto_compactions) {
+      // Automatic compactions would change the LSM shape being preserved
+      fprintf(stderr,
+              "rebuildfilters requires -use_existing_db=1 and "
+              "-disable_auto_compactions=1\n");
+      db_bench_exit(1);
+    }
+    if (db_.db != nullptr) {
+      RebuildFiltersHelper(db_);
+    } else {
+      for (auto& db_with_cfh : multi_dbs_) {
+        RebuildFiltersHelper(db_with_cfh);
       }
     }
   }
