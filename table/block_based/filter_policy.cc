@@ -26,6 +26,7 @@
 #include "rocksdb/utilities/object_registry.h"
 #include "rocksdb/utilities/options_type.h"
 #include "table/block_based/block_based_table_reader.h"
+#include "table/block_based/cuckoo_filter_policy.h"
 #include "table/block_based/filter_policy_internal.h"
 #include "table/block_based/full_filter_block.h"
 #include "util/atomic.h"
@@ -2024,6 +2025,14 @@ static int RegisterBuiltinFilterPolicies(ObjectLibrary& library,
         guard->reset(
             NewBuiltinFilterPolicyWithBits<test::Standard128RibbonFilterPolicy>(
                 uri));
+        return guard->get();
+      });
+  library.AddFactory<const FilterPolicy>(
+      FilterPatternEntryWithBits(CuckooFilterPolicy::kClassName())
+          .AnotherName(CuckooFilterPolicy::kNickName()),
+      [](const std::string& uri, std::unique_ptr<const FilterPolicy>* guard,
+         std::string* /* errmsg */) {
+        guard->reset(NewBuiltinFilterPolicyWithBits<CuckooFilterPolicy>(uri));
         return guard->get();
       });
   size_t num_types;
