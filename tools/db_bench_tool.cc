@@ -273,7 +273,8 @@ DEFINE_string(
     "writing output to separate directory without modifying source DB. "
     "Designed for remote compaction service testing\n"
     "\tstats       -- Print DB stats\n"
-    "\tresetstats  -- Reset DB stats\n"
+    "\tresetstats  -- Reset DB stats, and -statistics tickers and "
+    "histograms (e.g. to exclude a warm-up pass)\n"
     "\tlevelstats  -- Print the number of files and bytes per level\n"
     "\tmemstats  -- Print memtable stats\n"
     "\tsstables    -- Print sstable info\n"
@@ -473,6 +474,13 @@ DEFINE_int32(persistent_entries_value_size, 64,
              "deletes. (only compatible with "
              "--benchmarks='fillanddeleteuniquerandom' "
              "and used when--disposable_entries_batch_size is > 0).");
+
+DEFINE_double(read_missing_fraction, 0.0,
+              "Only used in readrandom: fraction of lookups, in [0, 1], for "
+              "keys that do not exist. A missing key is an existing key with "
+              "one byte appended (as in readmissing), so it sorts between "
+              "existing keys and cannot be excluded by SST key ranges; only "
+              "filters (or reading data blocks) can rule it out.");
 
 DEFINE_double(read_random_exp_range, 0.0,
               "Read random's key will be generated using distribution of "
@@ -7391,7 +7399,26 @@ class Benchmark {
     int64_t key_rand = 0;
     ReadOptions options = read_options_;
     std::unique_ptr<const char[]> key_guard;
+    // With -read_missing_fraction, allocate one spare byte so a generated
+    // key can be extended into a missing one
+    const bool mix_missing = FLAGS_read_missing_fraction > 0.0;
+    if (mix_missing) {
+      if (FLAGS_read_missing_fraction > 1.0 || !keys_.empty() ||
+          key_size_ != FLAGS_key_size) {
+        fprintf(stderr,
+                "-read_missing_fraction must be in [0, 1] and is only "
+                "supported by readrandom without -use_existing_keys\n");
+        db_bench_exit(1);
+      }
+      ++key_size_;
+    }
     Slice key = AllocateKey(&key_guard);
+    if (mix_missing) {
+      --key_size_;
+      key = Slice(key.data(), key_size_);
+    }
+    const uint64_t missing_threshold = static_cast<uint64_t>(
+        FLAGS_read_missing_fraction * double{uint64_t{1} << 32});
     PinnableSlice pinnable_val;
     PinnableWideColumns pinnable_columns;
     std::vector<PinnableSlice> pinnable_vals;
@@ -7430,7 +7457,15 @@ class Benchmark {
       } else {
         key_rand = GetRandomKey(&thread->rand);
       }
+      if (mix_missing) {
+        key = Slice(key.data(), key_size_);
+      }
       GenerateKeyFromInt(key_rand, FLAGS_num, &key);
+      if (mix_missing && (thread->rand.Next() >> 32) < missing_threshold) {
+        // Same construction as readmissing: append a padding byte
+        const_cast<char*>(key.data())[key_size_] = '0';
+        key = Slice(key.data(), key_size_ + 1);
+      }
       read++;
       std::string ts_ret;
       std::string* ts_ptr = nullptr;
@@ -10832,6 +10867,15 @@ class Benchmark {
     }
     for (const auto& db_with_cfh : multi_dbs_) {
       db_with_cfh.db->ResetStats();
+    }
+    // Also clear the Statistics object, so the STATISTICS dump at exit
+    // covers only benchmarks run after this point
+    if (dbstats) {
+      Status s = dbstats->Reset();
+      if (!s.ok()) {
+        fprintf(stderr, "resetstats: Statistics::Reset failed: %s\n",
+                s.ToString().c_str());
+      }
     }
   }
 
