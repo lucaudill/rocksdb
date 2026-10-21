@@ -11,6 +11,7 @@ int main() {
 }
 #else
 
+#include <algorithm>
 #include <cinttypes>
 #include <iostream>
 #include <sstream>
@@ -86,7 +87,8 @@ DEFINE_bool(new_builder, false,
 DEFINE_uint32(impl, 0,
               "Select filter implementation. Without -use_plain_table_bloom:"
               "0 = legacy full Bloom filter, "
-              "1 = format_version 5 Bloom filter, 2 = Ribbon128 filter. With "
+              "1 = format_version 5 Bloom filter, 2 = Ribbon128 filter, "
+              "3 = cuckoo filter. With "
               "-use_plain_table_bloom: 0 = no locality, 1 = locality.");
 
 DEFINE_bool(net_includes_hashing, false,
@@ -296,12 +298,20 @@ static uint32_t DryRunHash64(Slice& s) {
   return Lower32of64(GetSliceHash64(s));
 }
 
+// -impl value for the (non-built-in) cuckoo filter
+static constexpr uint32_t kCuckooImpl = 3;
+
 const std::shared_ptr<const FilterPolicy>& GetPolicy() {
   static std::shared_ptr<const FilterPolicy> policy;
   if (!policy) {
-    policy = BloomLikeFilterPolicy::Create(
-        BloomLikeFilterPolicy::GetAllFixedImpls().at(FLAGS_impl),
-        FLAGS_bits_per_key);
+    if (FLAGS_impl == kCuckooImpl) {
+      policy.reset(
+          ROCKSDB_NAMESPACE::NewCuckooFilterPolicy(FLAGS_bits_per_key));
+    } else {
+      policy = BloomLikeFilterPolicy::Create(
+          BloomLikeFilterPolicy::GetAllFixedImpls().at(FLAGS_impl),
+          FLAGS_bits_per_key);
+    }
   }
   return policy;
 }
@@ -360,9 +370,9 @@ void FilterBench::Go() {
           "-impl must currently be >= 0 and <= 1 for Plain table");
     }
   } else {
-    if (FLAGS_impl > 2) {
+    if (FLAGS_impl > kCuckooImpl) {
       throw std::runtime_error(
-          "-impl must currently be >= 0 and <= 2 for Block-based table");
+          "-impl must currently be >= 0 and <= 3 for Block-based table");
     }
   }
 
@@ -401,6 +411,9 @@ void FilterBench::Go() {
 #ifdef PREDICT_FP_RATE
   double weighted_predicted_fp_rate = 0.0;
 #endif
+  // Always tracked for cuckoo, for the FP rate sanity check (one cheap
+  // estimate per filter, so negligible in build timing)
+  double weighted_cuckoo_predicted_fp_rate = 0.0;
   size_t max_total_keys;
   size_t max_mem;
   if (FLAGS_m_keys_total_max > 0) {
@@ -459,6 +472,11 @@ void FilterBench::Go() {
           keys_to_add *
           builder->EstimatedFpRate(keys_to_add, info.filter_.size());
 #endif
+      if (FLAGS_impl == kCuckooImpl) {
+        weighted_cuckoo_predicted_fp_rate +=
+            keys_to_add *
+            builder->EstimatedFpRate(keys_to_add, info.filter_.size());
+      }
       if (FLAGS_new_builder) {
         builder.reset();
       }
@@ -502,6 +520,14 @@ void FilterBench::Go() {
 #endif
   if (!FLAGS_quick && !FLAGS_best_case) {
     double tolerable_rate = std::pow(2.0, -(bpk - 1.0) / (1.4 + bpk / 50.0));
+    if (FLAGS_impl == kCuckooImpl && !FLAGS_use_plain_table_bloom) {
+      // The bound above is tuned for Bloom-like filters, which cuckoo
+      // filters do not track at low bits/key. Allow the filter's own
+      // predicted rate, with headroom.
+      tolerable_rate =
+          std::max(tolerable_rate,
+                   1.25 * weighted_cuckoo_predicted_fp_rate / total_keys_added);
+    }
     std::cout << "Best possible FP rate %: " << 100.0 * std::pow(2.0, -bpk)
               << std::endl;
     std::cout << "Tolerable FP rate %: " << 100.0 * tolerable_rate << std::endl;

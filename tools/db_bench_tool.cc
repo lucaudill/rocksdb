@@ -847,11 +847,22 @@ DEFINE_int32(log_readahead_size, 0, "WAL and manifest readahead size");
 DEFINE_int32(writable_file_max_buffer_size, 1024 * 1024,
              "Maximum write buffer for Writable File");
 
-DEFINE_int32(bloom_bits, -1,
-             "Bloom filter bits per key. Negative means use default."
-             "Zero disables.");
+DEFINE_double(bloom_bits, -1,
+              "Filter bits per key, for whichever filter -filter_type selects "
+              "(fractional values allowed, e.g. 7.5). For Ribbon this is the "
+              "Bloom-equivalent bits per key (same FP rate as a Bloom filter "
+              "of this size). Negative means use default. Zero disables.");
 
-DEFINE_bool(use_ribbon_filter, false, "Use Ribbon instead of Bloom filter");
+DEFINE_bool(use_ribbon_filter, false,
+            "Use Ribbon instead of Bloom filter. Same as -filter_type=ribbon.");
+
+DEFINE_string(filter_type, "",
+              "Filter implementation for block-based tables when "
+              "-bloom_bits > 0: bloom, ribbon, or cuckoo. Empty means bloom, "
+              "or ribbon with -use_ribbon_filter. SST files must be read with "
+              "the same type they were written with: cuckoo filters and "
+              "Bloom/Ribbon filters cannot read each other, so a mismatch "
+              "silently disables filtering.");
 
 DEFINE_int32(bloom_before_level, 0,
              "Only used with -use_ribbon_filter. Use Bloom filters for LSM "
@@ -5271,7 +5282,7 @@ class Benchmark {
                 options.memtable_factory->Name());
       }
 
-      int bloom_bits_per_key = FLAGS_bloom_bits;
+      int bloom_bits_per_key = static_cast<int>(FLAGS_bloom_bits);
       if (bloom_bits_per_key < 0) {
         bloom_bits_per_key = PlainTableOptions().bloom_bits_per_key;
       }
@@ -5796,16 +5807,41 @@ class Benchmark {
         table_options->block_cache = cache_;
       }
       if (table_options->filter_policy == nullptr) {
+        std::string filter_type = FLAGS_filter_type;
+        if (filter_type.empty()) {
+          filter_type = FLAGS_use_ribbon_filter ? "ribbon" : "bloom";
+        } else if (FLAGS_use_ribbon_filter && filter_type != "ribbon") {
+          fprintf(stderr, "-use_ribbon_filter conflicts with -filter_type=%s\n",
+                  filter_type.c_str());
+          db_bench_exit(1);
+        }
+        if (filter_type != "bloom" && filter_type != "ribbon" &&
+            filter_type != "cuckoo") {
+          fprintf(stderr,
+                  "Unknown -filter_type=%s (expected bloom, ribbon, or "
+                  "cuckoo)\n",
+                  filter_type.c_str());
+          db_bench_exit(1);
+        }
         if (FLAGS_bloom_bits < 0) {
+          if (!FLAGS_filter_type.empty() || FLAGS_use_ribbon_filter) {
+            fprintf(stderr,
+                    "-filter_type/-use_ribbon_filter requires -bloom_bits > "
+                    "0\n");
+            db_bench_exit(1);
+          }
           table_options->filter_policy = BlockBasedTableOptions().filter_policy;
         } else if (FLAGS_bloom_bits == 0) {
           table_options->filter_policy.reset();
+        } else if (filter_type == "ribbon") {
+          table_options->filter_policy.reset(NewRibbonFilterPolicy(
+              FLAGS_bloom_bits, FLAGS_bloom_before_level));
+        } else if (filter_type == "cuckoo") {
+          table_options->filter_policy.reset(
+              NewCuckooFilterPolicy(FLAGS_bloom_bits));
         } else {
           table_options->filter_policy.reset(
-              FLAGS_use_ribbon_filter
-                  ? NewRibbonFilterPolicy(FLAGS_bloom_bits,
-                                          FLAGS_bloom_before_level)
-                  : NewBloomFilterPolicy(FLAGS_bloom_bits));
+              NewBloomFilterPolicy(FLAGS_bloom_bits));
         }
       }
     }
