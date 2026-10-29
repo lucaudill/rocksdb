@@ -92,3 +92,16 @@ In the results directory (default `filter_project/results/`):
   data; use `filter_bench` (`-impl=1` Bloom, `2` Ribbon, `3` Cuckoo) to
   measure filter construction and query cost in isolation.
 - `logs/`: full db_bench output for the load, every rebuild, and every run.
+
+## Analysis
+
+`analysis.ipynb` reads `results/results.csv` and `results/filters.csv`, makes one
+section of plots and tables per experiment, and writes the figures to `figures/`
+(PNG and PDF). It ends with a findings summary and helpers for exploring the data
+interactively. To set up its environment (conda or mamba):
+
+```bash
+conda env create -f filter_project/environment.yml
+conda activate rocksdb-filters
+cd filter_project && jupyter lab analysis.ipynb
+```

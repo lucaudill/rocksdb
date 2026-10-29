@@ -39,6 +39,7 @@ import itertools
 import json
 import os
 import re
+import resource
 import shutil
 import socket
 import subprocess
@@ -287,6 +288,42 @@ class Harness:
         with open(path, newline="") as f:
             return {row["run_id"] for row in csv.DictReader(f)}
 
+    # ------------------------------------------------- open-file limit --
+
+    def open_files_needed(self):
+        """Estimated file descriptors db_bench needs, or None if the config
+        caps open SST files itself (-open_files)."""
+        if "open_files" in self.load_flags or \
+                "open_files" in self.cfg.get("read_defaults", {}):
+            return None
+        # db_bench defaults to max_open_files=-1: every SST stays open
+        bytes_total = self.num * (int(self.load_flags.get("key_size", 16)) +
+                                  int(self.load_flags.get("value_size", 100)))
+        sst_files = bytes_total / int(
+            self.load_flags.get("target_file_size_base", 64 << 20))
+        # Headroom for files being compacted or rebuilt, logs, etc.
+        return int(sst_files * 1.25) + 512
+
+    def ensure_open_file_limit(self):
+        """Raise this process's soft open-file limit (inherited by db_bench)
+        or stop early with an explanation."""
+        need = self.open_files_needed()
+        if need is None:
+            return
+        soft, hard = resource.getrlimit(resource.RLIMIT_NOFILE)
+        if soft != resource.RLIM_INFINITY and soft < need:
+            if hard != resource.RLIM_INFINITY and hard < need:
+                die(f"db_bench keeps every SST file open and this DB needs "
+                    f"~{need} file descriptors, but the hard limit is {hard} "
+                    f"(`ulimit -Hn`). Ask an admin to raise it, or add "
+                    f"\"open_files\": 1000 to \"load\" in the config (RocksDB "
+                    f"then reopens files as needed, which adds some read "
+                    f"overhead).")
+            new_soft = need if hard == resource.RLIM_INFINITY else hard
+            resource.setrlimit(resource.RLIMIT_NOFILE, (new_soft, hard))
+            print(f"Raised open-file limit from {soft} to {new_soft} "
+                  f"(need ~{need})")
+
     # -------------------------------------------------------------- plan --
 
     def experiments(self):
@@ -336,6 +373,17 @@ class Harness:
               f"({'exists' if os.path.isdir(self.base) else 'not loaded'}), "
               f"{self.num:,} keys")
         print(f"Repeats: {self.repeats}")
+        need = self.open_files_needed()
+        if need is not None:
+            soft, hard = resource.getrlimit(resource.RLIMIT_NOFILE)
+            if soft == resource.RLIM_INFINITY or soft >= need:
+                status = "OK"
+            elif hard == resource.RLIM_INFINITY or hard >= need:
+                status = "OK, soft limit will be raised automatically"
+            else:
+                status = "TOO LOW: see `ulimit -Hn`"
+            print(f"Open files: need ~{need}; limit soft {soft}, hard {hard}"
+                  f" ({status})")
         for fname, runs in specs.items():
             n = len(runs) * self.repeats
             left = sum(1 for rep in range(1, self.repeats + 1)
@@ -631,6 +679,8 @@ def main():
     args = p.parse_args()
 
     h = Harness(args)
+    if args.command != "plan" and not args.dry_run:
+        h.ensure_open_file_limit()
     if args.command != "plan" and not args.dry_run and \
             not os.access(h.db_bench, os.X_OK):
         die(f"no executable db_bench at {h.db_bench}; build it with "
