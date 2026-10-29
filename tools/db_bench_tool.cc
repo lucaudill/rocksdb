@@ -255,6 +255,9 @@ DEFINE_string(
     "\tcompact0  -- compact L0 into L1\n"
     "\tcompact1  -- compact L1 into L2\n"
     "\twaitforcompaction - pause until compaction is (probably) done\n"
+    "\trebuildfilters -- rewrite every SST file in place (same level and "
+    "key range) so its filter is rebuilt with the current filter flags; "
+    "requires -use_existing_db and -disable_auto_compactions\n"
     "\tflush - flush the memtable\n"
     "\tingestexternalfile -- Create external SST files and ingest them into "
     "the DB via IngestExternalFile\n"
@@ -270,7 +273,8 @@ DEFINE_string(
     "writing output to separate directory without modifying source DB. "
     "Designed for remote compaction service testing\n"
     "\tstats       -- Print DB stats\n"
-    "\tresetstats  -- Reset DB stats\n"
+    "\tresetstats  -- Reset DB stats, and -statistics tickers and "
+    "histograms (e.g. to exclude a warm-up pass)\n"
     "\tlevelstats  -- Print the number of files and bytes per level\n"
     "\tmemstats  -- Print memtable stats\n"
     "\tsstables    -- Print sstable info\n"
@@ -470,6 +474,13 @@ DEFINE_int32(persistent_entries_value_size, 64,
              "deletes. (only compatible with "
              "--benchmarks='fillanddeleteuniquerandom' "
              "and used when--disposable_entries_batch_size is > 0).");
+
+DEFINE_double(read_missing_fraction, 0.0,
+              "Only used in readrandom: fraction of lookups, in [0, 1], for "
+              "keys that do not exist. A missing key is an existing key with "
+              "one byte appended (as in readmissing), so it sorts between "
+              "existing keys and cannot be excluded by SST key ranges; only "
+              "filters (or reading data blocks) can rule it out.");
 
 DEFINE_double(read_random_exp_range, 0.0,
               "Read random's key will be generated using distribution of "
@@ -847,11 +858,30 @@ DEFINE_int32(log_readahead_size, 0, "WAL and manifest readahead size");
 DEFINE_int32(writable_file_max_buffer_size, 1024 * 1024,
              "Maximum write buffer for Writable File");
 
-DEFINE_int32(bloom_bits, -1,
-             "Bloom filter bits per key. Negative means use default."
-             "Zero disables.");
+DEFINE_double(bloom_bits, -1,
+              "Filter bits per key, for whichever filter -filter_type selects "
+              "(fractional values allowed, e.g. 7.5). For Ribbon this is the "
+              "Bloom-equivalent bits per key (same FP rate as a Bloom filter "
+              "of this size). Negative means use default. Zero disables.");
 
-DEFINE_bool(use_ribbon_filter, false, "Use Ribbon instead of Bloom filter");
+DEFINE_bool(use_ribbon_filter, false,
+            "Use Ribbon instead of Bloom filter. Same as -filter_type=ribbon.");
+
+DEFINE_string(filter_type, "",
+              "Filter implementation for block-based tables when "
+              "-bloom_bits > 0: bloom, ribbon, or cuckoo. Empty means bloom, "
+              "or ribbon with -use_ribbon_filter. SST files must be read with "
+              "the same type they were written with: cuckoo filters and "
+              "Bloom/Ribbon filters cannot read each other, so a mismatch "
+              "silently disables filtering.");
+
+DEFINE_int32(bloom_before_level, 0,
+             "Only used with -use_ribbon_filter. Use Bloom filters for LSM "
+             "levels below this one and Ribbon filters starting at this level. "
+             "Memtable flushes count as level -1. 0 (default) -> Bloom only "
+             "for flushes, Ribbon otherwise; -1 -> always Ribbon; "
+             "a large value (e.g. 999) -> always Bloom. See "
+             "NewRibbonFilterPolicy().");
 
 DEFINE_double(memtable_bloom_size_ratio, 0,
               "Ratio of memtable size used for bloom filter. 0 means no bloom "
@@ -4405,6 +4435,8 @@ class Benchmark {
         CompactLevel(1);
       } else if (name == "waitforcompaction") {
         WaitForCompaction();
+      } else if (name == "rebuildfilters") {
+        RebuildFilters();
       } else if (name == "flush") {
         Flush();
       } else if (name == "crc32c") {
@@ -5263,7 +5295,7 @@ class Benchmark {
                 options.memtable_factory->Name());
       }
 
-      int bloom_bits_per_key = FLAGS_bloom_bits;
+      int bloom_bits_per_key = static_cast<int>(FLAGS_bloom_bits);
       if (bloom_bits_per_key < 0) {
         bloom_bits_per_key = PlainTableOptions().bloom_bits_per_key;
       }
@@ -5788,14 +5820,41 @@ class Benchmark {
         table_options->block_cache = cache_;
       }
       if (table_options->filter_policy == nullptr) {
+        std::string filter_type = FLAGS_filter_type;
+        if (filter_type.empty()) {
+          filter_type = FLAGS_use_ribbon_filter ? "ribbon" : "bloom";
+        } else if (FLAGS_use_ribbon_filter && filter_type != "ribbon") {
+          fprintf(stderr, "-use_ribbon_filter conflicts with -filter_type=%s\n",
+                  filter_type.c_str());
+          db_bench_exit(1);
+        }
+        if (filter_type != "bloom" && filter_type != "ribbon" &&
+            filter_type != "cuckoo") {
+          fprintf(stderr,
+                  "Unknown -filter_type=%s (expected bloom, ribbon, or "
+                  "cuckoo)\n",
+                  filter_type.c_str());
+          db_bench_exit(1);
+        }
         if (FLAGS_bloom_bits < 0) {
+          if (!FLAGS_filter_type.empty() || FLAGS_use_ribbon_filter) {
+            fprintf(stderr,
+                    "-filter_type/-use_ribbon_filter requires -bloom_bits > "
+                    "0\n");
+            db_bench_exit(1);
+          }
           table_options->filter_policy = BlockBasedTableOptions().filter_policy;
         } else if (FLAGS_bloom_bits == 0) {
           table_options->filter_policy.reset();
+        } else if (filter_type == "ribbon") {
+          table_options->filter_policy.reset(NewRibbonFilterPolicy(
+              FLAGS_bloom_bits, FLAGS_bloom_before_level));
+        } else if (filter_type == "cuckoo") {
+          table_options->filter_policy.reset(
+              NewCuckooFilterPolicy(FLAGS_bloom_bits));
         } else {
           table_options->filter_policy.reset(
-              FLAGS_use_ribbon_filter ? NewRibbonFilterPolicy(FLAGS_bloom_bits)
-                                      : NewBloomFilterPolicy(FLAGS_bloom_bits));
+              NewBloomFilterPolicy(FLAGS_bloom_bits));
         }
       }
     }
@@ -7340,7 +7399,26 @@ class Benchmark {
     int64_t key_rand = 0;
     ReadOptions options = read_options_;
     std::unique_ptr<const char[]> key_guard;
+    // With -read_missing_fraction, allocate one spare byte so a generated
+    // key can be extended into a missing one
+    const bool mix_missing = FLAGS_read_missing_fraction > 0.0;
+    if (mix_missing) {
+      if (FLAGS_read_missing_fraction > 1.0 || !keys_.empty() ||
+          key_size_ != FLAGS_key_size) {
+        fprintf(stderr,
+                "-read_missing_fraction must be in [0, 1] and is only "
+                "supported by readrandom without -use_existing_keys\n");
+        db_bench_exit(1);
+      }
+      ++key_size_;
+    }
     Slice key = AllocateKey(&key_guard);
+    if (mix_missing) {
+      --key_size_;
+      key = Slice(key.data(), key_size_);
+    }
+    const uint64_t missing_threshold = static_cast<uint64_t>(
+        FLAGS_read_missing_fraction * double{uint64_t{1} << 32});
     PinnableSlice pinnable_val;
     PinnableWideColumns pinnable_columns;
     std::vector<PinnableSlice> pinnable_vals;
@@ -7379,7 +7457,15 @@ class Benchmark {
       } else {
         key_rand = GetRandomKey(&thread->rand);
       }
+      if (mix_missing) {
+        key = Slice(key.data(), key_size_);
+      }
       GenerateKeyFromInt(key_rand, FLAGS_num, &key);
+      if (mix_missing && (thread->rand.Next() >> 32) < missing_threshold) {
+        // Same construction as readmissing: append a padding byte
+        const_cast<char*>(key.data())[key_size_] = '0';
+        key = Slice(key.data(), key_size_ + 1);
+      }
       read++;
       std::string ts_ret;
       std::string* ts_ptr = nullptr;
@@ -10569,6 +10655,87 @@ class Benchmark {
     }
   }
 
+  // Prints aggregated table properties (entries, data size, filter size, ...)
+  // for each non-empty level, prefixed by `tag`, for comparing LSM shape.
+  static void PrintLevelTableProperties(DB* db, ColumnFamilyHandle* cfh,
+                                        const char* tag) {
+    for (int level = 0; level < db->NumberLevels(cfh); ++level) {
+      std::string num_files;
+      std::string props;
+      const std::string level_str = std::to_string(level);
+      if (!db->GetProperty(cfh, "rocksdb.num-files-at-level" + level_str,
+                           &num_files) ||
+          num_files == "0") {
+        continue;
+      }
+      if (db->GetProperty(
+              cfh, "rocksdb.aggregated-table-properties-at-level" + level_str,
+              &props)) {
+        fprintf(stdout, "%s L%d: # files=%s; %s\n", tag, level,
+                num_files.c_str(), props.c_str());
+      }
+    }
+  }
+
+  // Rewrites each SST file with a single-file CompactFiles() into the level
+  // it already occupies. Keys, values, file count per level and key range
+  // per file are unchanged, so lookups touch exactly the same files; only
+  // the filter (and file numbers) change. The output is one file per input
+  // (no size limit) and is always rewritten, never trivially moved.
+  void RebuildFiltersHelper(DBWithColumnFamilies& db_with_cfh) {
+    DB* db = db_with_cfh.db;
+    std::vector<ColumnFamilyHandle*> cfhs = db_with_cfh.cfh;
+    if (cfhs.empty()) {
+      cfhs.push_back(db->DefaultColumnFamily());
+    }
+    CompactionOptions copts;
+    copts.output_file_size_limit = std::numeric_limits<uint64_t>::max();
+    copts.allow_trivial_move = false;
+    copts.max_subcompactions = 1;
+
+    for (ColumnFamilyHandle* cfh : cfhs) {
+      PrintLevelTableProperties(db, cfh, "rebuildfilters before");
+      // Snapshot the file list up front; each rewrite adds a new file.
+      ColumnFamilyMetaData meta;
+      db->GetColumnFamilyMetaData(cfh, &meta);
+      uint64_t start = FLAGS_env->NowMicros();
+      size_t rewritten = 0;
+      for (const LevelMetaData& level : meta.levels) {
+        for (const SstFileMetaData& file : level.files) {
+          Status s = db->CompactFiles(copts, cfh, {file.name}, level.level);
+          if (!s.ok()) {
+            fprintf(stderr,
+                    "rebuildfilters: CompactFiles(%s, L%d) failed: %s\n",
+                    file.name.c_str(), level.level, s.ToString().c_str());
+            db_bench_exit(1);
+          }
+          ++rewritten;
+        }
+      }
+      fprintf(stdout, "rebuildfilters(%s, %s): rewrote %zu files in %.3f s\n",
+              db->GetName().c_str(), cfh->GetName().c_str(), rewritten,
+              (FLAGS_env->NowMicros() - start) / 1e6);
+      PrintLevelTableProperties(db, cfh, "rebuildfilters after");
+    }
+  }
+
+  void RebuildFilters() {
+    if (!FLAGS_use_existing_db || !FLAGS_disable_auto_compactions) {
+      // Automatic compactions would change the LSM shape being preserved
+      fprintf(stderr,
+              "rebuildfilters requires -use_existing_db=1 and "
+              "-disable_auto_compactions=1\n");
+      db_bench_exit(1);
+    }
+    if (db_.db != nullptr) {
+      RebuildFiltersHelper(db_);
+    } else {
+      for (auto& db_with_cfh : multi_dbs_) {
+        RebuildFiltersHelper(db_with_cfh);
+      }
+    }
+  }
+
   bool CompactLevelHelper(DBWithColumnFamilies& db_with_cfh, int from_level) {
     std::vector<LiveFileMetaData> files;
     db_with_cfh.db->GetLiveFilesMetaData(&files);
@@ -10700,6 +10867,15 @@ class Benchmark {
     }
     for (const auto& db_with_cfh : multi_dbs_) {
       db_with_cfh.db->ResetStats();
+    }
+    // Also clear the Statistics object, so the STATISTICS dump at exit
+    // covers only benchmarks run after this point
+    if (dbstats) {
+      Status s = dbstats->Reset();
+      if (!s.ok()) {
+        fprintf(stderr, "resetstats: Statistics::Reset failed: %s\n",
+                s.ToString().c_str());
+      }
     }
   }
 

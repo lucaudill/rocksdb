@@ -1,0 +1,20 @@
+# Conda environment for filter_project/analysis.ipynb
+#
+#   conda env create -f filter_project/environment.yml
+#   conda activate rocksdb-filters
+#   cd filter_project && jupyter lab analysis.ipynb
+#
+# Update after editing this file:
+#   conda env update -f filter_project/environment.yml --prune
+name: rocksdb-filters
+channels:
+  - conda-forge
+  - nodefaults
+dependencies:
+  - python=3.12
+  - numpy>=1.26
+  - pandas>=2.2
+  - matplotlib>=3.8
+  - jinja2>=3.1        # pandas Styler (the formatted tables)
+  - jupyterlab>=4
+  - ipykernel

@@ -1038,6 +1038,76 @@ TEST_F(DBBloomFilterTest, BloomFilterCompatibility) {
   }
 }
 
+// A cuckoo filter works end to end, with whole and partitioned filters, and
+// through Get and MultiGet. Under a built-in policy, its SST files are simply
+// unfiltered (never wrong), because the policies are not read-compatible.
+TEST_F(DBBloomFilterTest, CuckooFilterEndToEnd) {
+  for (bool partitioned : {false, true}) {
+    SCOPED_TRACE("partitioned=" + std::to_string(partitioned));
+    Options options = CurrentOptions();
+    options.statistics = ROCKSDB_NAMESPACE::CreateDBStatistics();
+    BlockBasedTableOptions table_options;
+    // 15-bit fingerprints -> ~0.02% FP rate
+    table_options.filter_policy.reset(NewCuckooFilterPolicy(16));
+    table_options.detect_filter_construct_corruption = true;
+    table_options.partition_filters = partitioned;
+    table_options.index_type =
+        partitioned ? BlockBasedTableOptions::IndexType::kTwoLevelIndexSearch
+                    : BlockBasedTableOptions::IndexType::kBinarySearch;
+    // Many small filter partitions
+    table_options.metadata_block_size = 256;
+    options.table_factory.reset(NewBlockBasedTableFactory(table_options));
+    DestroyAndReopen(options);
+
+    // Even keys present, odd keys absent
+    const int kNumKeys = 10000;
+    for (int i = 0; i < kNumKeys; ++i) {
+      ASSERT_OK(Put(Key(2 * i), "v" + std::to_string(i)));
+    }
+    ASSERT_OK(Flush());
+
+    TablePropertiesCollection props;
+    ASSERT_OK(db_->GetPropertiesOfAllTables(&props));
+    ASSERT_EQ(props.size(), 1U);
+    for (const auto& p : props) {
+      EXPECT_EQ(p.second->filter_policy_name, "cuckoofilter");
+      EXPECT_GT(p.second->filter_size, 0U);
+    }
+
+    for (int i = 0; i < kNumKeys; ++i) {
+      ASSERT_EQ("v" + std::to_string(i), Get(Key(2 * i)));
+    }
+    EXPECT_EQ(PopTicker(options, BLOOM_FILTER_USEFUL), 0);
+    for (int i = 0; i < kNumKeys; ++i) {
+      ASSERT_EQ("NOT_FOUND", Get(Key(2 * i + 1)));
+    }
+    EXPECT_GE(PopTicker(options, BLOOM_FILTER_USEFUL), kNumKeys * 0.99);
+
+    // Batched lookups, half present and half absent
+    std::vector<std::string> keys;
+    for (int i = 0; i < 64; ++i) {
+      keys.push_back(Key(4000 + i));
+    }
+    std::vector<std::string> values = MultiGet(keys);
+    ASSERT_EQ(values.size(), keys.size());
+    for (int i = 0; i < 64; ++i) {
+      ASSERT_EQ(values[i], i % 2 == 0 ? "v" + std::to_string((4000 + i) / 2)
+                                      : "NOT_FOUND");
+    }
+    EXPECT_GE(PopTicker(options, BLOOM_FILTER_USEFUL), 30U);
+
+    // Reopen under a built-in policy: no filtering, but correct results
+    table_options.filter_policy.reset(NewBloomFilterPolicy(10));
+    options.table_factory.reset(NewBlockBasedTableFactory(table_options));
+    Reopen(options);
+    for (int i = 0; i < 1000; ++i) {
+      ASSERT_EQ("v" + std::to_string(i), Get(Key(2 * i)));
+      ASSERT_EQ("NOT_FOUND", Get(Key(2 * i + 1)));
+    }
+    EXPECT_EQ(PopTicker(options, BLOOM_FILTER_USEFUL), 0);
+  }
+}
+
 // To align with the type of hash entry being reserved in implementation.
 using FilterConstructionReserveMemoryHash = uint64_t;
 

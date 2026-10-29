@@ -25,7 +25,9 @@ int main() {
 #include "port/jemalloc_helper.h"
 #include "rocksdb/convenience.h"
 #include "rocksdb/filter_policy.h"
+#include "table/block_based/cuckoo_filter_policy.h"
 #include "table/block_based/filter_policy_internal.h"
+#include "table/multiget_context.h"
 #include "test_util/testharness.h"
 #include "test_util/testutil.h"
 #include "util/gflags_compat.h"
@@ -1188,6 +1190,315 @@ TEST(RibbonTest, RibbonTestLevelThreshold) {
       }
     }
   }
+}
+
+// ############################ Cuckoo filter ############################ //
+
+class CuckooFilterTest : public testing::Test {
+ protected:
+  BlockBasedTableOptions table_options_;
+  std::unique_ptr<FilterBitsBuilder> builder_;
+  std::unique_ptr<FilterBitsReader> reader_;
+  std::unique_ptr<const char[]> buf_;
+  Slice filter_;
+
+  void Reset(double bits_per_key) {
+    table_options_.filter_policy.reset(NewCuckooFilterPolicy(bits_per_key));
+    builder_.reset(table_options_.filter_policy->GetBuilderWithContext(
+        FilterBuildingContext(table_options_)));
+    reader_.reset();
+    buf_.reset();
+    filter_ = Slice();
+  }
+
+  const CuckooFilterPolicy& Policy() const {
+    return static_cast<const CuckooFilterPolicy&>(
+        *table_options_.filter_policy);
+  }
+
+  // Adds Key(begin) .. Key(end - 1)
+  void AddRange(int begin, int end) {
+    char buffer[sizeof(int)];
+    for (int i = begin; i < end; ++i) {
+      builder_->AddKey(Key(i, buffer));
+    }
+  }
+
+  void Build() {
+    filter_ = builder_->Finish(&buf_);
+    OpenRaw(filter_);
+  }
+
+  void OpenRaw(const Slice& contents) {
+    reader_.reset(table_options_.filter_policy->GetFilterBitsReader(contents));
+  }
+
+  bool Matches(int i) {
+    char buffer[sizeof(int)];
+    return reader_->MayMatch(Key(i, buffer));
+  }
+
+  void AssertAllMatch(int begin, int end) {
+    for (int i = begin; i < end; ++i) {
+      ASSERT_TRUE(Matches(i)) << "key " << i;
+    }
+  }
+
+  // Probes keys disjoint from any added by these tests
+  double FalsePositiveRate(int num_probes = 100000) {
+    int fps = 0;
+    for (int i = 0; i < num_probes; ++i) {
+      fps += Matches(i + 1000000000) ? 1 : 0;
+    }
+    return fps / double(num_probes);
+  }
+};
+
+TEST_F(CuckooFilterTest, PolicyConfiguration) {
+  // {bits_per_key, expected fingerprint bits}
+  const std::vector<std::pair<double, int> > cases = {
+      {1.0, 4},   {4.0, 4},   {6.0, 5},   {7.5, 7},   {8.0, 7},   {10.0, 9},
+      {12.0, 11}, {16.0, 15}, {20.0, 19}, {40.0, 32}, {500.0, 32}};
+  for (const auto& [bits_per_key, fp_bits] : cases) {
+    SCOPED_TRACE("bits_per_key=" + std::to_string(bits_per_key));
+    Reset(bits_per_key);
+    EXPECT_EQ(Policy().GetFingerprintBits(), fp_bits);
+    ASSERT_NE(builder_, nullptr);
+  }
+  // No filter
+  for (double bits_per_key : {0.0, -1.0, std::nan("")}) {
+    Reset(bits_per_key);
+    EXPECT_EQ(builder_, nullptr);
+  }
+
+  Reset(10);
+  EXPECT_STREQ(Policy().Name(), "cuckoofilter");
+  EXPECT_STREQ(Policy().CompatibilityName(), "rocksdb.CuckooFilter");
+  EXPECT_EQ(Policy().GetId(), "cuckoofilter:10");
+  Reset(7.25);
+  EXPECT_EQ(Policy().GetId(), "cuckoofilter:7.25");
+
+  // Configuration by string, including the nickname
+  ConfigOptions config_options;
+  std::shared_ptr<const FilterPolicy> policy;
+  for (const char* str : {"cuckoofilter:7.25", "rocksdb.CuckooFilter:7.25"}) {
+    SCOPED_TRACE(str);
+    ASSERT_OK(FilterPolicy::CreateFromString(config_options, str, &policy));
+    ASSERT_NE(policy, nullptr);
+    EXPECT_TRUE(policy->IsInstanceOf(CuckooFilterPolicy::kClassName()));
+    EXPECT_EQ(policy->GetId(), "cuckoofilter:7.25");
+  }
+}
+
+TEST_F(CuckooFilterTest, EmptyFilter) {
+  Reset(10);
+  EXPECT_EQ(builder_->EstimateEntriesAdded(), size_t{0});
+  Build();
+  EXPECT_EQ(filter_.size(), size_t{0});
+  EXPECT_FALSE(Matches(0));
+  EXPECT_FALSE(Matches(12345));
+}
+
+TEST_F(CuckooFilterTest, VaryingLengthsAndWidths) {
+  // Covers the one-load bucket read (fingerprint bits <= 14) and the
+  // per-slot read (> 14), and the minimum fingerprint width.
+  for (double bits_per_key : {4.0, 7.5, 10.0, 16.0, 33.0}) {
+    for (int length = 1; length <= 10000; length = NextLength(length)) {
+      SCOPED_TRACE("bits_per_key=" + std::to_string(bits_per_key) +
+                   " length=" + std::to_string(length));
+      Reset(bits_per_key);
+      AddRange(0, length);
+      EXPECT_EQ(builder_->EstimateEntriesAdded(), size_t(length));
+      const size_t expected_size = builder_->CalculateSpace(length);
+      Build();
+
+      ASSERT_NO_FATAL_FAILURE(AssertAllMatch(0, length));
+      // At most a couple of ~1/16 growth retries
+      EXPECT_GE(filter_.size(), expected_size);
+      EXPECT_LE(filter_.size(), expected_size * 9 / 8 + 16);
+
+      if (length >= 1000) {
+        double expected_fp = builder_->EstimatedFpRate(length, filter_.size());
+        double rate = FalsePositiveRate();
+        if (kVerbose >= 1 && length == 10000) {
+          fprintf(stderr,
+                  "Cuckoo %5.2f bits/key requested, %5.2f actual: FP rate "
+                  "%7.4f%% (estimated %7.4f%%)\n",
+                  bits_per_key, 8.0 * filter_.size() / length, rate * 100.0,
+                  expected_fp * 100.0);
+        }
+        EXPECT_LE(rate, expected_fp * 1.3 + 0.001);
+        EXPECT_GE(rate, expected_fp * 0.7 - 0.001);
+      }
+    }
+  }
+}
+
+TEST_F(CuckooFilterTest, LargeFilterAtTargetSpace) {
+  // Big enough that construction relies on eviction at ~90% load
+  const int kNumKeys = 300000;
+  Reset(10);
+  AddRange(0, kNumKeys);
+  Build();
+  ASSERT_NO_FATAL_FAILURE(AssertAllMatch(0, kNumKeys));
+  double bits_per_key = 8.0 * filter_.size() / kNumKeys;
+  EXPECT_GE(bits_per_key, 10.0);
+  EXPECT_LE(bits_per_key, 10.1);  // built on the first attempt
+  double rate = FalsePositiveRate();
+  EXPECT_GT(rate, 0.010);
+  EXPECT_LT(rate, 0.018);  // ~1.4% expected for 9-bit fingerprints
+}
+
+TEST_F(CuckooFilterTest, BatchedMayMatch) {
+  Reset(10);
+  AddRange(0, 5000);
+  Build();
+  char buffers[MultiGetContext::MAX_BATCH_SIZE][sizeof(int)];
+  Slice keys[MultiGetContext::MAX_BATCH_SIZE];
+  Slice* key_ptrs[MultiGetContext::MAX_BATCH_SIZE];
+  bool may_match[MultiGetContext::MAX_BATCH_SIZE];
+  // Batches straddle present (< 5000) and absent keys
+  for (int start = 4000; start < 7000;
+       start += MultiGetContext::MAX_BATCH_SIZE) {
+    for (int i = 0; i < MultiGetContext::MAX_BATCH_SIZE; ++i) {
+      keys[i] = Key(start + i, buffers[i]);
+      key_ptrs[i] = &keys[i];
+    }
+    reader_->MayMatch(MultiGetContext::MAX_BATCH_SIZE, key_ptrs, may_match);
+    for (int i = 0; i < MultiGetContext::MAX_BATCH_SIZE; ++i) {
+      ASSERT_EQ(may_match[i], reader_->MayMatch(keys[i])) << start + i;
+      if (start + i < 5000) {
+        ASSERT_TRUE(may_match[i]) << start + i;
+      }
+    }
+  }
+}
+
+TEST_F(CuckooFilterTest, DuplicatesAndAlts) {
+  // Non-adjacent repeats are not collapsed by AddKey. Many more copies than
+  // two buckets can hold must still build a real (not always-true) filter.
+  Reset(10);
+  for (int round = 0; round < 20; ++round) {
+    AddRange(0, 100);
+  }
+  Build();
+  EXPECT_GT(filter_.size(), size_t{0});
+  ASSERT_NO_FATAL_FAILURE(AssertAllMatch(0, 100));
+  EXPECT_LT(FalsePositiveRate(), 0.05);
+
+  // Whole keys plus prefixes ("alts"), as with whole_key_filtering and a
+  // prefix extractor. Keys are 4 bytes; prefixes are the first 3.
+  Reset(10);
+  char buffer[sizeof(int)];
+  std::vector<std::string> prefixes;
+  for (int i = 0; i < 2000; ++i) {
+    Slice key = Key(i, buffer);
+    Slice prefix(key.data(), 3);
+    prefixes.push_back(prefix.ToString());
+    builder_->AddKeyAndAlt(key, prefix);
+  }
+  Build();
+  ASSERT_NO_FATAL_FAILURE(AssertAllMatch(0, 2000));
+  for (const std::string& prefix : prefixes) {
+    ASSERT_TRUE(reader_->MayMatch(prefix));
+  }
+  // A key that is its own prefix (key == alt) must still be added
+  Reset(10);
+  builder_->AddKeyAndAlt("same", "same");
+  builder_->AddKeyAndAlt("same2", "same2");
+  Build();
+  EXPECT_TRUE(reader_->MayMatch("same"));
+  EXPECT_TRUE(reader_->MayMatch("same2"));
+}
+
+TEST_F(CuckooFilterTest, SpaceEstimates) {
+  for (double bits_per_key : {4.0, 7.5, 10.0, 16.0, 33.0}) {
+    SCOPED_TRACE("bits_per_key=" + std::to_string(bits_per_key));
+    Reset(bits_per_key);
+    EXPECT_EQ(builder_->CalculateSpace(0), size_t{0});
+    EXPECT_EQ(builder_->ApproximateNumEntries(0), size_t{0});
+    double prev_fp = 1.0;
+    for (size_t n : {size_t{1}, size_t{7}, size_t{100}, size_t{12345},
+                     size_t{1000000}, size_t{50000000}}) {
+      SCOPED_TRACE("n=" + std::to_string(n));
+      size_t space = builder_->CalculateSpace(n);
+      // Round trips in both directions
+      EXPECT_GE(builder_->ApproximateNumEntries(space), n);
+      EXPECT_LE(
+          builder_->CalculateSpace(builder_->ApproximateNumEntries(space)),
+          space);
+      if (n >= 100) {
+        // Space, excluding the fixed 8-byte trailer, tracks the target (or
+        // the minimum fingerprint width)
+        double actual = 8.0 * double(space - 8) / double(n);
+        EXPECT_GE(actual, std::min(bits_per_key, 4.0 / 0.95) - 0.01);
+        EXPECT_LE(actual, std::max(bits_per_key, 4.0 / 0.95) * 1.02 + 0.1);
+      }
+      // More space for the same entries means a lower FP rate
+      double fp = builder_->EstimatedFpRate(n, space);
+      double fp_bigger = builder_->EstimatedFpRate(n, space * 2);
+      EXPECT_GT(fp, 0.0);
+      EXPECT_LT(fp_bigger, fp);
+      EXPECT_LE(fp, 1.0);
+      prev_fp = fp;
+    }
+    (void)prev_fp;
+  }
+}
+
+TEST_F(CuckooFilterTest, CorruptOrForeignFilters) {
+  Reset(10);
+  AddRange(0, 1000);
+  Build();
+  const std::string good = filter_.ToString();
+
+  auto expect_always_true = [&](const std::string& contents) {
+    OpenRaw(contents);
+    for (int i = 1000000; i < 1000100; ++i) {
+      ASSERT_TRUE(Matches(i));
+    }
+  };
+  // Too short to have a trailer
+  ASSERT_NO_FATAL_FAILURE(expect_always_true("abc"));
+  // Truncated, and extended
+  ASSERT_NO_FATAL_FAILURE(expect_always_true(good.substr(1)));
+  ASSERT_NO_FATAL_FAILURE(expect_always_true(good + "x"));
+  // Each trailer field mangled: num_buckets, fp bits, slots, version, magic
+  for (size_t field : {size_t{0}, size_t{4}, size_t{5}, size_t{6}, size_t{7}}) {
+    SCOPED_TRACE("trailer byte " + std::to_string(field));
+    std::string bad = good;
+    bad[bad.size() - 8 + field] ^= 0x5a;
+    ASSERT_NO_FATAL_FAILURE(expect_always_true(bad));
+  }
+  // A built-in Bloom filter is not a cuckoo filter
+  std::unique_ptr<const FilterPolicy> bloom(NewBloomFilterPolicy(10));
+  std::unique_ptr<FilterBitsBuilder> bloom_builder(
+      bloom->GetBuilderWithContext(FilterBuildingContext(table_options_)));
+  char buffer[sizeof(int)];
+  bloom_builder->AddKey(Key(1, buffer));
+  std::unique_ptr<const char[]> bloom_buf;
+  ASSERT_NO_FATAL_FAILURE(
+      expect_always_true(bloom_builder->Finish(&bloom_buf).ToString()));
+
+  // The intact filter still works after all that
+  OpenRaw(good);
+  ASSERT_NO_FATAL_FAILURE(AssertAllMatch(0, 1000));
+}
+
+TEST_F(CuckooFilterTest, DetectConstructionCorruption) {
+  table_options_.detect_filter_construct_corruption = true;
+  Reset(10);
+  AddRange(0, 1000);
+  Build();
+  EXPECT_OK(builder_->MaybePostVerify(filter_));
+
+  Reset(10);
+  AddRange(0, 1000);
+  Build();
+  // Wipe the fingerprints but keep the trailer
+  std::string tampered = filter_.ToString();
+  std::fill(tampered.begin(), tampered.end() - 8, '\0');
+  EXPECT_TRUE(builder_->MaybePostVerify(tampered).IsCorruption());
 }
 
 }  // namespace ROCKSDB_NAMESPACE

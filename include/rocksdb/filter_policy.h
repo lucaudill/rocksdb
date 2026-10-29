@@ -209,4 +209,28 @@ const FilterPolicy* NewBloomFilterPolicy(
 FilterPolicy* NewRibbonFilterPolicy(double bloom_equivalent_bits_per_key,
                                     int bloom_before_level = 0);
 
+// EXPERIMENTAL: A per-SST-file cuckoo filter (Fan et al., "Cuckoo Filter:
+// Practically Better Than Bloom", CoNEXT 2014), with 4-slot buckets and
+// partial-key cuckoo hashing. bits_per_key is the target average space per
+// key, and the fingerprint width is derived from it as
+// floor(0.95 * bits_per_key), clamped to [4, 32], with the table sized for
+// at most 95% occupancy. For example, 10 bits/key yields 9-bit fingerprints
+// at 90% occupancy and an FP rate of about 1.4%, compared with about 1% for
+// a Bloom filter of the same size. Cuckoo filters gain relative to Bloom as
+// bits_per_key grows. bits_per_key <= 0 means "generate no filter"; values
+// below ~4.2 are rounded up to the minimum fingerprint width.
+//
+// Queries probe at most two buckets (typically two cache-line accesses).
+// Construction keeps the full set of key hashes and inserts them with
+// random-walk eviction; this temporary memory is not charged to the block
+// cache, and optimize_filters_for_memory is ignored.
+//
+// Filters are written under a distinct CompatibilityName(), so they are
+// readable only by this policy, and this policy cannot read built-in
+// Bloom/Ribbon filters. A DB switched to or from this policy filters
+// nothing on existing SST files until compaction rewrites them.
+//
+// Also configurable by string, as in "cuckoofilter:10".
+const FilterPolicy* NewCuckooFilterPolicy(double bits_per_key);
+
 }  // namespace ROCKSDB_NAMESPACE

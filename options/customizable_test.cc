@@ -34,6 +34,7 @@
 #include "rocksdb/utilities/customizable_util.h"
 #include "rocksdb/utilities/object_registry.h"
 #include "rocksdb/utilities/options_type.h"
+#include "table/block_based/cuckoo_filter_policy.h"
 #include "table/block_based/filter_policy_internal.h"
 #include "table/block_based/flush_block_policy_impl.h"
 #include "table/mock_table.h"
@@ -2030,6 +2031,8 @@ TEST_F(LoadCustomizableTest, LoadFilterPolicyTest) {
       BloomFilterPolicy::kNickName(),
       kAutoRibbon,
       RibbonFilterPolicy::kNickName(),
+      CuckooFilterPolicy::kClassName(),
+      CuckooFilterPolicy::kNickName(),
   });
   ASSERT_OK(TestExpectedBuiltins<const FilterPolicy>(
       "Mock", expected, &result, &failures, [](const std::string& name) {
