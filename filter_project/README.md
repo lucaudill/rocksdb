@@ -105,3 +105,27 @@ conda env create -f filter_project/environment.yml
 conda activate rocksdb-filters
 cd filter_project && jupyter lab analysis.ipynb
 ```
+
+## Filter-only measurements (`filter_sweep.py`)
+
+`filter_sweep.py` runs `filter_bench` (no database) for construction cost,
+query CPU and FPR, mirroring the base DB's filters (~1910 keys per SST filter,
+64-byte keys). Build a release `filter_bench` first
+(`DEBUG_LEVEL=0 make filter_bench`).
+
+```bash
+python3 filter_project/filter_sweep.py calibrate   # bits/key setting per filter for each real bits/key target
+python3 filter_project/filter_sweep.py run         # equal_bits + cuckoo sawtooth, 3 repeats
+```
+
+- `equal_bits`: Bloom, Ribbon, Cuckoo at 6, 8, 10, 12, 16, 20 real bits/key
+  (`--targets`). Settings are calibrated by bisection on filter_bench's stored
+  bits/key and cached per host in `results/filter_calibration.csv`. Bloom can
+  only land within about +-0.13 bits/key of a target (whole 64-byte cache
+  lines per filter), so plot against `real_bits`.
+- `sawtooth`: Cuckoo over settings 6 to 24 in 0.25 steps (`--sawtooth`), with
+  fingerprint width, load and model FPR in each row.
+- Output: `results/filter_bench.csv`, logs in `results/logs/filter_bench/`.
+  Resumable; `run_id` includes the host, so build and query times from
+  different machines are kept apart (only compare within one host).
+- About 15 minutes on an M-series Mac at the defaults.
