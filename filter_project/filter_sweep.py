@@ -68,13 +68,13 @@ CALIB_FIELDS = [
 ]
 
 PATTERNS = {
-    "build_ns_per_key": r"Build avg ns/key: ([0-9.eE+-]+)",
+    "build_ns_per_key": r"Build avg ns/key: (\S+)",
     "num_filters": r"Number of filters: (\d+)",
-    "total_size_mb": r"Total size \(MB\): ([0-9.eE+-]+)",
-    "real_bits": r"Bits/key stored: ([0-9.eE+-]+)",
-    "fp_rate_pct": r"Average FP rate %: ([0-9.eE+-]+)",
-    "query_single_filter_ns": r"Single filter net ns/op: ([0-9.eE+-]+)",
-    "query_random_filter_ns": r"Random filter net ns/op: ([0-9.eE+-]+)",
+    "total_size_mb": r"Total size \(MB\): (\S+)",
+    "real_bits": r"Bits/key stored: (\S+)",
+    "fp_rate_pct": r"Average FP rate %: (\S+)",
+    "query_single_filter_ns": r"Single filter net ns/op: (\S+)",
+    "query_random_filter_ns": r"Random filter net ns/op: (\S+)",
 }
 
 
@@ -146,8 +146,18 @@ class Bench:
         res = {}
         for key, pat in PATTERNS.items():
             m = re.search(pat, out)
-            if m:
-                res[key] = float(m.group(1))
+            if not m:
+                continue
+            # filter_bench prints nan (macOS) or -nan (glibc) for 0/0, e.g.
+            # query times when a calibration build runs no queries. Leave
+            # such values out of the row rather than recording them.
+            try:
+                value = float(m.group(1))
+            except ValueError:
+                sys.exit("unexpected %s value %r in filter_bench output:\n%s"
+                         % (key, m.group(1), out[-2000:]))
+            if math.isfinite(value):
+                res[key] = value
         if "real_bits" not in res:
             sys.exit("could not parse filter_bench output:\n" + out[-2000:])
         return res, os.path.relpath(log_path, PROJECT) if log_path else ""
